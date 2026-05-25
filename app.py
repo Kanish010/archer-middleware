@@ -667,7 +667,7 @@ def archer_soap_search_records(
         url,
         headers={
             "Content-Type": "text/xml; charset=utf-8",
-            "SOAPAction": '"http://archer-tech.com/webservices/SearchRecordsByReport"',
+            "SOAPAction": "http://archer-tech.com/webservices/SearchRecordsByReport",
         },
         data=soap_body.encode("utf-8"),
         verify=VERIFY_SSL,
