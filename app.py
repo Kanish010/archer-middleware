@@ -108,124 +108,174 @@ else:
 # ============================================================
 
 WRAPPER_KEYS = {
-    "payload", "data", "record", "current", "body",
-    "request", "result", "requestedobject", "content",
-    "fields", "values",
+    "payload",
+    "data",
+    "record",
+    "current",
+    "body",
+    "request",
+    "result",
+    "requestedobject",
+    "content",
 }
 
 
-def parse_inbound_request() -> Dict[str, Any]:
-    """
-    Robustly parse the inbound request body.
-    Handles: JSON, form data, raw body, stringified JSON.
-    """
-    # Try normal JSON first
-    payload = request.get_json(force=True, silent=True)
+def parse_json_if_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
 
-    if payload is not None:
-        return unwrap_payload(payload)
+    text = value.strip()
 
-    # Try form data
-    if request.form:
-        form_dict = dict(request.form)
-        # Check if any form value is stringified JSON
-        for key, value in form_dict.items():
-            if isinstance(value, str) and value.strip().startswith("{"):
-                try:
-                    parsed = json_module.loads(value)
-                    if isinstance(parsed, dict):
-                        return unwrap_payload(parsed)
-                except (json_module.JSONDecodeError, ValueError):
-                    pass
-        return unwrap_payload(form_dict)
+    if not text:
+        return value
 
-    # Try raw body
-    raw = request.get_data(as_text=True)
-    if raw and raw.strip():
-        # Try parsing as JSON
-        try:
-            parsed = json_module.loads(raw.strip())
-            if isinstance(parsed, dict):
-                return unwrap_payload(parsed)
-        except (json_module.JSONDecodeError, ValueError):
-            pass
+    if not (
+        (text.startswith("{") and text.endswith("}"))
+        or (text.startswith("[") and text.endswith("]"))
+    ):
+        return value
 
-    raise ValueError("Could not parse request body as JSON.")
+    try:
+        return json_module.loads(text)
+    except Exception:
+        return value
 
 
 def unwrap_payload(data: Any) -> Dict[str, Any]:
     """
-    Recursively unwrap common wrapper keys like payload, data,
-    record, current, body, request, result, RequestedObject.
-    Also handles stringified JSON values.
+    Recursively unwraps common wrappers used by Archer, ServiceNow,
+    webhooks, test tools, and proxy layers.
     """
+    data = parse_json_if_string(data)
+
     if not isinstance(data, dict):
-        return data if isinstance(data, dict) else {}
+        return {}
 
-    # Check if any value is stringified JSON and parse it
     for key, value in list(data.items()):
-        if isinstance(value, str) and value.strip().startswith("{"):
-            try:
-                parsed = json_module.loads(value)
-                if isinstance(parsed, dict):
-                    data[key] = parsed
-            except (json_module.JSONDecodeError, ValueError):
-                pass
+        data[key] = parse_json_if_string(value)
 
-    # If the dict has exactly one key and it's a wrapper key, unwrap it
     if len(data) == 1:
-        only_key = list(data.keys())[0]
-        if only_key.lower() in WRAPPER_KEYS:
-            inner = data[only_key]
-            if isinstance(inner, dict):
-                return unwrap_payload(inner)
+        only_key = next(iter(data.keys()))
+        if str(only_key).lower() in WRAPPER_KEYS and isinstance(data[only_key], dict):
+            return unwrap_payload(data[only_key])
 
-    # If the dict has a wrapper key whose value is a dict with more
-    # useful-looking keys than the outer dict, prefer the inner
-    for key in list(data.keys()):
-        if key.lower() in WRAPPER_KEYS and isinstance(data[key], dict):
-            inner = data[key]
-            # Only unwrap if the inner dict has content-like keys
-            inner_keys_lower = {k.lower() for k in inner.keys()}
-            content_signals = {
-                "finding_id", "finding", "description", "short_description",
-                "state", "priority", "sys_id", "number", "archer_finding_id",
-                "finding id", "overall_status",
+    content_signals = {
+        "finding_id",
+        "finding",
+        "description",
+        "short_description",
+        "state",
+        "priority",
+        "sys_id",
+        "number",
+        "archer_finding_id",
+        "finding id",
+        "overall_status",
+        "archerfindingid",
+        "findingtext",
+    }
+
+    for key, value in list(data.items()):
+        if str(key).lower() in WRAPPER_KEYS and isinstance(value, dict):
+            inner_keys_lower = {str(k).lower() for k in value.keys()}
+            normalized_inner_keys = {
+                re.sub(r"[^a-z0-9]", "", str(k).lower())
+                for k in value.keys()
             }
-            if inner_keys_lower & content_signals:
-                return unwrap_payload(inner)
+
+            if inner_keys_lower & content_signals or normalized_inner_keys & content_signals:
+                return unwrap_payload(value)
 
     return data
 
 
+def parse_inbound_request() -> Dict[str, Any]:
+    """
+    Robustly parse incoming request body from:
+    - JSON body
+    - form data
+    - raw JSON string
+    - wrapped/stringified JSON
+    """
+    payload: Any = None
+
+    try:
+        payload = request.get_json(force=False, silent=True)
+    except Exception:
+        payload = None
+
+    if payload is not None:
+        parsed = unwrap_payload(payload)
+        if parsed:
+            return parsed
+
+    if request.form:
+        form_dict = request.form.to_dict(flat=True)
+
+        for _, value in form_dict.items():
+            parsed_value = parse_json_if_string(value)
+            if isinstance(parsed_value, dict):
+                parsed = unwrap_payload(parsed_value)
+                if parsed:
+                    return parsed
+
+        parsed = unwrap_payload(form_dict)
+        if parsed:
+            return parsed
+
+    raw = request.get_data(as_text=True) or ""
+    raw = raw.strip()
+
+    if raw:
+        parsed_raw = parse_json_if_string(raw)
+        parsed = unwrap_payload(parsed_raw)
+        if parsed:
+            return parsed
+
+    raise ValueError(
+        f"Could not parse request body as JSON. "
+        f"Content-Type: {request.content_type}. "
+        f"Raw body preview: {raw[:300]}"
+    )
+
+
+def normalize_key(key: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+
 def flex_get(data: Dict[str, Any], *candidate_keys: str, default: Any = None) -> Any:
     """
-    Flexible key lookup that normalizes key names.
-    flex_get(d, "finding_id", "Finding ID", "findingId", "archerFindingId")
-    will match any of those keys regardless of case/format.
+    Flexible key lookup.
+
+    Handles:
+    - finding_id
+    - Finding ID
+    - findingId
+    - archerFindingId
+    - nested dictionaries
     """
     if not isinstance(data, dict):
         return default
 
-    # Build a normalized lookup: strip, lowercase, remove _ and spaces
-    def normalize(k: str) -> str:
-        return re.sub(r"[\s_\-]", "", k.lower())
-
-    normalized_data = {normalize(k): v for k, v in data.items()}
+    normalized_data = {normalize_key(k): v for k, v in data.items()}
 
     for candidate in candidate_keys:
-        # Direct match first
         if candidate in data:
             val = data[candidate]
             if val is not None and str(val).strip():
                 return val
 
-        # Normalized match
-        norm_candidate = normalize(candidate)
+        norm_candidate = normalize_key(candidate)
         if norm_candidate in normalized_data:
             val = normalized_data[norm_candidate]
             if val is not None and str(val).strip():
                 return val
+
+    for value in data.values():
+        if isinstance(value, dict):
+            found = flex_get(value, *candidate_keys, default=None)
+            if found is not None and str(found).strip():
+                return found
 
     return default
 
@@ -239,9 +289,11 @@ def clean_html_text(value: Any) -> str:
         return ""
 
     text = str(value)
+
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</p\s*>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
+
     text = html.unescape(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -254,6 +306,7 @@ def clean_html_text(value: Any) -> str:
 def safe_str(value: Any, default: str = "") -> str:
     if value is None:
         return default
+
     text = str(value).strip()
     return text if text else default
 
@@ -277,6 +330,7 @@ def finding_id_to_tracking_number(finding_id: str) -> str:
     match = re.search(r"(\d+)", finding_id or "")
     if not match:
         raise ValueError(f"Could not extract numeric tracking number from finding_id: {finding_id}")
+
     return match.group(1)
 
 
@@ -327,25 +381,53 @@ def servicenow_table_url() -> str:
 
 
 def normalize_archer_payload_for_servicenow(payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = unwrap_payload(payload)
+
     finding_id = safe_str(
-        flex_get(payload, "finding_id", "Finding ID", "archer_finding_id",
-                 "archerFindingId", "id", "FND ID")
+        flex_get(
+            payload,
+            "finding_id",
+            "Finding ID",
+            "FindingId",
+            "archer_finding_id",
+            "archerFindingId",
+            "id",
+            "tracking_id",
+            "Tracking ID",
+            "fnd_id",
+            "FND ID",
+        )
     )
 
     finding_text = safe_str(
-        flex_get(payload, "finding", "Finding", "description", "Description",
-                 "findingText", "finding_text")
+        flex_get(
+            payload,
+            "finding",
+            "Finding",
+            "finding_text",
+            "Finding Text",
+            "findingText",
+            "description",
+            "Description",
+            "issue_description",
+            "Issue Description",
+        )
     )
 
     priority = safe_str(
-        flex_get(payload, "priority", "Priority") or "3"
+        flex_get(payload, "priority", "Priority", "severity", "Severity"),
+        "3",
     )
+
     state = safe_str(
-        flex_get(payload, "state", "State", "overall_status", "Overall Status") or "Open"
+        flex_get(payload, "state", "State", "status", "Status", "overall_status", "Overall Status"),
+        "Open",
     )
 
     if not finding_id:
-        raise ValueError("Missing finding_id in Archer payload.")
+        raise ValueError(
+            f"Missing finding_id in Archer payload. Received keys: {list(payload.keys())}"
+        )
 
     if not finding_id.upper().startswith("FND-"):
         finding_id = f"FND-{finding_id}"
@@ -366,6 +448,7 @@ def normalize_archer_payload_for_servicenow(payload: Dict[str, Any]) -> Dict[str
         "description": description,
         "priority": priority,
         "state": state,
+        "raw_archer_payload": payload,
     }
 
 
@@ -441,7 +524,8 @@ def archer_headers(token: Optional[str] = None) -> Dict[str, str]:
     }
 
     if token:
-        headers["Authorization"] = f'Archer session-id="{token}"'
+        # Important: do not wrap token in quotes.
+        headers["Authorization"] = f"Archer session-id={token}"
 
     return headers
 
@@ -471,9 +555,11 @@ def archer_login() -> str:
     data = response.json()
 
     if isinstance(data, dict):
+        requested = data.get("RequestedObject")
         token = (
-            (data.get("RequestedObject") or {}).get("SessionToken")
-            if isinstance(data.get("RequestedObject"), dict) else None
+            requested.get("SessionToken")
+            if isinstance(requested, dict)
+            else None
         ) or data.get("SessionToken") or data.get("sessionToken")
     else:
         token = None
@@ -502,7 +588,6 @@ def get_archer_field_ids(
 
     data = response.json()
 
-    # Handle both list and dict responses
     if isinstance(data, list):
         fields = data
     elif isinstance(data, dict):
@@ -529,7 +614,9 @@ def get_archer_field_ids(
         for field in fields:
             if not isinstance(field, dict):
                 continue
+
             field_guid = str(field.get("Guid") or field.get("GUID") or "").lower()
+
             if field_guid == target_guid.lower():
                 matched_field = field
                 break
@@ -540,6 +627,7 @@ def get_archer_field_ids(
             )
 
         field_id = matched_field.get("Id") or matched_field.get("ID")
+
         if field_id is None:
             raise RuntimeError(f"Matched Archer field '{logical_name}' but no Id found.")
 
@@ -576,7 +664,10 @@ def try_archer_content_update(
     level_id: int = 62,
 ) -> Dict[str, Any]:
     """
-    Try updating Archer content. Uses the correct Content wrapper format.
+    Correct Archer content update body.
+
+    Do not change this back to RequestedObject.
+    Archer accepted the Content wrapper format.
     """
     body = {
         "Content": {
@@ -741,6 +832,7 @@ def parse_soap_search_records(
                     continue
 
                 field_id_raw = field.attrib.get("id") or field.attrib.get("fieldId")
+
                 if str(field_id_raw) == str(finding_id_field_id):
                     finding_id_value = clean_html_text(field.text or "")
                     break
@@ -795,30 +887,64 @@ def find_archer_content_id_by_finding_id(
 # ============================================================
 
 def normalize_servicenow_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = unwrap_payload(payload)
+
     description = safe_str(
-        flex_get(payload, "description", "Description", "comments", "work_notes")
+        flex_get(
+            payload,
+            "description",
+            "Description",
+            "comments",
+            "Comments",
+            "work_notes",
+            "Work notes",
+            "workNotes",
+        )
     )
 
     short_description = safe_str(
-        flex_get(payload, "short_description", "Short description", "title")
+        flex_get(
+            payload,
+            "short_description",
+            "Short description",
+            "shortDescription",
+            "title",
+            "Title",
+        )
     )
 
     archer_finding_id = (
-        safe_str(flex_get(payload, "archer_finding_id", "archerFindingId"))
+        safe_str(
+            flex_get(
+                payload,
+                "archer_finding_id",
+                "archerFindingId",
+                "finding_id",
+                "Finding ID",
+                "fnd_id",
+                "FND ID",
+            )
+        )
         or extract_archer_id_from_text(description)
         or extract_archer_id_from_text(short_description)
     )
 
     if not archer_finding_id:
         raise ValueError(
-            "Could not find Archer Finding ID. Expected marker like [ARCHER_ID:FND-1635]."
+            "Could not find Archer Finding ID. "
+            "Expected direct field like finding_id / archer_finding_id "
+            "or marker like [ARCHER_ID:FND-1635]. "
+            f"Received keys: {list(payload.keys())}"
         )
+
+    if not archer_finding_id.upper().startswith("FND-"):
+        archer_finding_id = f"FND-{archer_finding_id}"
 
     return {
         "archer_finding_id": archer_finding_id.upper(),
         "short_description": short_description,
         "description": description,
-        "state": safe_str(flex_get(payload, "state", "State")),
+        "state": safe_str(flex_get(payload, "state", "State", "status", "Status")),
         "priority": safe_str(flex_get(payload, "priority", "Priority")),
         "raw": payload,
     }
@@ -844,29 +970,36 @@ def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
 
     application_id = FINDINGS_APPLICATION_ID
 
-    # ----------------------------------------------------------------
-    # Use hardcoded field IDs from environment variables.
-    # These are known from the /debug/archer-fields call and never
-    # change, so we skip the API field lookup entirely to avoid the
-    # list-vs-dict response format issue from the Archer API.
-    # ----------------------------------------------------------------
-    finding_id_field_id = get_env_int("ARCHER_FIELD_FINDING_ID", 2260)
-    finding_field_id = get_env_int("ARCHER_FIELD_FINDING", 2265)
-
-    hardcoded_field_ids = {
-        "Finding ID": finding_id_field_id,
-        "Finding": finding_field_id,
+    fields_needed = {
+        "Finding ID": ARCHER_FIELDS["Finding ID"],
     }
+
+    for field_name in archer_payload["fields_to_update"].keys():
+        if field_name not in ARCHER_FIELDS:
+            raise RuntimeError(f"Missing field GUID config for Archer field: {field_name}")
+
+        field_guid = ARCHER_FIELDS[field_name]
+
+        if not field_guid:
+            raise RuntimeError(f"Empty field GUID config for Archer field: {field_name}")
+
+        fields_needed[field_name] = field_guid
+
+    field_ids = get_archer_field_ids(
+        token=token,
+        application_id=application_id,
+        field_guid_map=fields_needed,
+    )
 
     content_id = find_archer_content_id_by_finding_id(
         token=token,
         application_id=application_id,
-        finding_id_field_id=hardcoded_field_ids["Finding ID"],
+        finding_id_field_id=field_ids["Finding ID"],
         finding_id=archer_payload["finding_id"],
     )
 
     field_contents = build_archer_field_contents_for_text_updates(
-        field_ids=hardcoded_field_ids,
+        field_ids=field_ids,
         fields_to_update=archer_payload["fields_to_update"],
     )
 
@@ -876,9 +1009,12 @@ def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
         field_contents=field_contents,
     )
 
+    if not update_result.get("success"):
+        raise RuntimeError(f"Archer content update failed: {update_result}")
+
     return {
         "dry_run": False,
-        "message": "Archer update attempted.",
+        "message": "Archer update completed.",
         "finding_id": archer_payload["finding_id"],
         "archer_content_id": content_id,
         "field_contents_sent": field_contents,
@@ -896,10 +1032,17 @@ def root():
         {
             "service": "Archer-ServiceNow Middleware",
             "status": "running",
+            "hosting": "Render",
             "endpoints": [
                 "/health",
                 "/archer-to-servicenow",
                 "/servicenow-to-archer",
+                "/debug-env",
+                "/debug-servicenow",
+                "/debug-archer-login",
+                "/debug-archer-fields",
+                "/debug-find-content/FND-1635",
+                "/debug-echo",
             ],
         }
     ), 200
@@ -962,6 +1105,7 @@ def archer_to_servicenow():
                 "error": "ServiceNow HTTP error",
                 "status_code": resp.status_code if resp else None,
                 "response": resp.text[:1000] if resp else None,
+                "traceback": traceback.format_exc(),
             }
         ), 500
 
@@ -1012,6 +1156,7 @@ def servicenow_to_archer():
                 "error": "HTTP error during ServiceNow to Archer sync",
                 "status_code": resp.status_code if resp else None,
                 "response": resp.text[:1000] if resp else None,
+                "traceback": traceback.format_exc(),
             }
         ), 500
 
@@ -1032,15 +1177,26 @@ def servicenow_to_archer():
 @app.route("/debug-env", methods=["GET"])
 def debug_env():
     required_vars = [
-        "SERVICENOW_INSTANCE_URL", "SERVICENOW_USERNAME", "SERVICENOW_PASSWORD",
-        "SERVICENOW_TABLE", "ARCHER_API_BASE_URL", "ARCHER_SOAP_BASE_URL",
-        "ARCHER_INSTANCE_NAME", "ARCHER_USERNAME", "ARCHER_PASSWORD",
-        "FINDINGS_APPLICATION_GUID", "FINDINGS_APPLICATION_ID",
-        "ARCHER_FIELD_FINDING_ID_GUID", "ARCHER_FIELD_FINDING_GUID",
-        "ARCHER_REVERSE_SYNC_DRY_RUN", "FLASK_DEBUG", "CORS_ORIGINS",
+        "SERVICENOW_INSTANCE_URL",
+        "SERVICENOW_USERNAME",
+        "SERVICENOW_PASSWORD",
+        "SERVICENOW_TABLE",
+        "ARCHER_API_BASE_URL",
+        "ARCHER_SOAP_BASE_URL",
+        "ARCHER_INSTANCE_NAME",
+        "ARCHER_USERNAME",
+        "ARCHER_PASSWORD",
+        "FINDINGS_APPLICATION_GUID",
+        "FINDINGS_APPLICATION_ID",
+        "ARCHER_FIELD_FINDING_ID_GUID",
+        "ARCHER_FIELD_FINDING_GUID",
+        "ARCHER_REVERSE_SYNC_DRY_RUN",
+        "FLASK_DEBUG",
+        "CORS_ORIGINS",
     ]
 
     result = {}
+
     for key in required_vars:
         value = os.getenv(key)
         result[key] = {
@@ -1061,18 +1217,147 @@ def debug_servicenow():
             params={"sysparm_limit": "1"},
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-        return jsonify({"ok": resp.ok, "status_code": resp.status_code, "preview": resp.text[:500]}), resp.status_code
+
+        return jsonify(
+            {
+                "ok": resp.ok,
+                "status_code": resp.status_code,
+                "preview": resp.text[:500],
+            }
+        ), resp.status_code
+
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        ), 500
 
 
 @app.route("/debug-archer-login", methods=["GET"])
 def debug_archer_login():
     try:
         token = archer_login()
-        return jsonify({"ok": True, "token_exists": bool(token), "token_preview": token[:6] + "..." if token else None}), 200
+
+        return jsonify(
+            {
+                "ok": True,
+                "token_exists": bool(token),
+                "token_preview": token[:6] + "..." if token else None,
+            }
+        ), 200
+
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "traceback": traceback.format_exc()}), 500
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        ), 500
+
+
+@app.route("/debug-archer-fields", methods=["GET"])
+def debug_archer_fields():
+    try:
+        token = archer_login()
+
+        field_ids = get_archer_field_ids(
+            token=token,
+            application_id=FINDINGS_APPLICATION_ID,
+            field_guid_map={
+                "Finding ID": ARCHER_FIELDS["Finding ID"],
+                "Finding": ARCHER_FIELDS["Finding"],
+            },
+        )
+
+        return jsonify(
+            {
+                "ok": True,
+                "application_id": FINDINGS_APPLICATION_ID,
+                "field_ids": field_ids,
+            }
+        ), 200
+
+    except Exception as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        ), 500
+
+
+@app.route("/debug-find-content/<finding_id>", methods=["GET"])
+def debug_find_content(finding_id: str):
+    try:
+        token = archer_login()
+
+        field_ids = get_archer_field_ids(
+            token=token,
+            application_id=FINDINGS_APPLICATION_ID,
+            field_guid_map={
+                "Finding ID": ARCHER_FIELDS["Finding ID"],
+            },
+        )
+
+        content_id = find_archer_content_id_by_finding_id(
+            token=token,
+            application_id=FINDINGS_APPLICATION_ID,
+            finding_id_field_id=field_ids["Finding ID"],
+            finding_id=finding_id,
+        )
+
+        return jsonify(
+            {
+                "ok": True,
+                "finding_id": finding_id,
+                "finding_id_field_id": field_ids["Finding ID"],
+                "content_id": content_id,
+            }
+        ), 200
+
+    except Exception as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        ), 500
+
+
+@app.route("/debug-echo", methods=["POST"])
+def debug_echo():
+    try:
+        payload = parse_inbound_request()
+
+        return jsonify(
+            {
+                "ok": True,
+                "parsed_payload": payload,
+                "content_type": request.content_type,
+                "headers": {
+                    key: value
+                    for key, value in request.headers.items()
+                    if key.lower() not in {"authorization", "cookie"}
+                },
+            }
+        ), 200
+
+    except Exception as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(exc),
+                "content_type": request.content_type,
+                "raw_body": request.get_data(as_text=True)[:1000],
+                "traceback": traceback.format_exc(),
+            }
+        ), 400
 
 
 # ============================================================
