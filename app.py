@@ -820,19 +820,42 @@ def find_archer_content_id_by_finding_id(
     finding_id_field_id: int,
     finding_id: str,
 ) -> int:
-    soap_text = archer_soap_search_records(
-        token=token,
-        application_id=application_id,
-        finding_id_field_id=finding_id_field_id,
-        finding_id=finding_id,
-    )
+    page_size = get_env_int("ARCHER_SEARCH_PAGE_SIZE", 500)
+    max_pages = get_env_int("ARCHER_SEARCH_MAX_PAGES", 20)
 
-    return find_matching_content_id_in_execute_search_result(
-        soap_text=soap_text,
-        finding_id_field_id=finding_id_field_id,
-        finding_id=finding_id,
-    )
+    errors_seen = []
 
+    for page_number in range(1, max_pages + 1):
+        soap_text = archer_soap_search_records(
+            token=token,
+            application_id=application_id,
+            finding_id_field_id=finding_id_field_id,
+            finding_id=finding_id,
+            page_number=page_number,
+            page_size=page_size,
+        )
+
+        try:
+            return find_matching_content_id_in_execute_search_result(
+                soap_text=soap_text,
+                finding_id_field_id=finding_id_field_id,
+                finding_id=finding_id,
+            )
+        except RuntimeError as exc:
+            error_text = str(exc)
+            errors_seen.append(f"Page {page_number}: {error_text[:500]}")
+
+            # If the page has fewer/no records, stop early.
+            if "Records seen: []" in error_text or "Empty ExecuteSearchResult" in error_text:
+                break
+
+            continue
+
+    raise RuntimeError(
+        f"Could not find Archer content ID for {finding_id} after searching "
+        f"{max_pages} pages of {page_size} records. "
+        f"Last errors: {errors_seen[-3:]}"
+    )
 
 # ============================================================
 # Reverse sync payload builder
