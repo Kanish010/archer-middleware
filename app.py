@@ -67,7 +67,7 @@ ARCHER_PASSWORD = get_env_required("ARCHER_PASSWORD")
 VERIFY_SSL = get_env_bool("VERIFY_SSL", True)
 REQUEST_TIMEOUT_SECONDS = get_env_int("REQUEST_TIMEOUT_SECONDS", 30)
 
-FINDINGS_APPLICATION_GUID = get_env_required("FINDINGS_APPLICATION_GUID")
+FINDINGS_APPLICATION_GUID = get_env_optional("FINDINGS_APPLICATION_GUID", "")
 FINDINGS_APPLICATION_ID = get_env_int("FINDINGS_APPLICATION_ID", 167)
 FINDINGS_LEVEL_ID = get_env_int("FINDINGS_LEVEL_ID", 62)
 
@@ -83,16 +83,6 @@ CORS_ORIGINS = [
     for origin in get_env_optional("CORS_ORIGINS", "").split(",")
     if origin.strip()
 ]
-
-ARCHER_FIELDS = {
-    "Finding ID": get_env_optional("ARCHER_FIELD_FINDING_ID_GUID", ""),
-    "Finding": get_env_optional("ARCHER_FIELD_FINDING_GUID", ""),
-    "Overall Status": get_env_optional("ARCHER_FIELD_OVERALL_STATUS_GUID", ""),
-    "Response": get_env_optional("ARCHER_FIELD_RESPONSE_GUID", ""),
-    "Assigned To": get_env_optional("ARCHER_FIELD_ASSIGNED_TO_GUID", ""),
-    "Reviewer": get_env_optional("ARCHER_FIELD_REVIEWER_GUID", ""),
-    "Business Response": get_env_optional("ARCHER_FIELD_BUSINESS_RESPONSE_GUID", ""),
-}
 
 
 # ============================================================
@@ -634,16 +624,10 @@ def try_archer_content_update(
 # Archer SOAP search helpers
 # ============================================================
 
-def archer_soap_headers() -> Dict[str, str]:
-    return {
-        "Content-Type": "text/xml; charset=utf-8",
-        "SOAPAction": "http://archer-tech.com/webservices/SearchRecordsByReport",
-    }
-
-
 def archer_soap_search_records(
     token: str,
     application_id: int,
+    finding_id_field_id: int,
     page_number: int,
     page_size: int,
     max_record_count: int,
@@ -655,7 +639,7 @@ def archer_soap_search_records(
   <PageSize>{page_size}</PageSize>
   <MaxRecordCount>{max_record_count}</MaxRecordCount>
   <DisplayFields>
-    <DisplayField>{application_id}</DisplayField>
+    <DisplayField>{finding_id_field_id}</DisplayField>
   </DisplayFields>
   <Criteria>
     <ModuleCriteria>
@@ -681,13 +665,23 @@ def archer_soap_search_records(
 
     response = requests.post(
         url,
-        headers=archer_soap_headers(),
+        headers={
+            "Content-Type": "text/xml; charset=utf-8",
+            "SOAPAction": '"http://archer-tech.com/webservices/SearchRecordsByReport"',
+        },
         data=soap_body.encode("utf-8"),
         verify=VERIFY_SSL,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
 
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(
+            "Archer SOAP search failed. "
+            f"Status: {response.status_code}. "
+            f"Response preview: {response.text[:2000]}. "
+            f"Search XML: {search_xml}"
+        )
+
     return response.text
 
 
@@ -769,6 +763,7 @@ def find_archer_content_id_by_finding_id(
         soap_text = archer_soap_search_records(
             token=token,
             application_id=application_id,
+            finding_id_field_id=finding_id_field_id,
             page_number=page_number,
             page_size=page_size,
             max_record_count=max_record_count,
@@ -878,9 +873,6 @@ def build_archer_reverse_payload(sn_data: Dict[str, Any]) -> Dict[str, Any]:
 def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
     token = archer_login()
 
-    application_id = FINDINGS_APPLICATION_ID
-    level_id = FINDINGS_LEVEL_ID
-
     field_ids = {
         "Finding ID": ARCHER_FINDING_ID_FIELD_ID,
         "Finding": ARCHER_FINDING_TEXT_FIELD_ID,
@@ -888,7 +880,7 @@ def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
 
     content_id = find_archer_content_id_by_finding_id(
         token=token,
-        application_id=application_id,
+        application_id=FINDINGS_APPLICATION_ID,
         finding_id_field_id=field_ids["Finding ID"],
         finding_id=archer_payload["finding_id"],
     )
@@ -902,7 +894,7 @@ def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
         token=token,
         content_id=content_id,
         field_contents=field_contents,
-        level_id=level_id,
+        level_id=FINDINGS_LEVEL_ID,
     )
 
     if not update_result.get("success"):
@@ -1087,8 +1079,6 @@ def debug_env():
         "FINDINGS_LEVEL_ID",
         "ARCHER_FINDING_ID_FIELD_ID",
         "ARCHER_FINDING_TEXT_FIELD_ID",
-        "ARCHER_FIELD_FINDING_ID_GUID",
-        "ARCHER_FIELD_FINDING_GUID",
         "ARCHER_REVERSE_SYNC_DRY_RUN",
         "FLASK_DEBUG",
         "CORS_ORIGINS",
