@@ -842,39 +842,31 @@ def build_archer_reverse_payload(sn_data: Dict[str, Any]) -> Dict[str, Any]:
 def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
     token = archer_login()
 
-    # Use the known application ID directly instead of looking it up by GUID.
-    # This avoids the GUID-matching issue entirely.
     application_id = FINDINGS_APPLICATION_ID
 
-    fields_needed = {
-        "Finding ID": ARCHER_FIELDS["Finding ID"],
+    # ----------------------------------------------------------------
+    # Use hardcoded field IDs from environment variables.
+    # These are known from the /debug/archer-fields call and never
+    # change, so we skip the API field lookup entirely to avoid the
+    # list-vs-dict response format issue from the Archer API.
+    # ----------------------------------------------------------------
+    finding_id_field_id = get_env_int("ARCHER_FIELD_FINDING_ID", 2260)
+    finding_field_id = get_env_int("ARCHER_FIELD_FINDING", 2265)
+
+    hardcoded_field_ids = {
+        "Finding ID": finding_id_field_id,
+        "Finding": finding_field_id,
     }
-
-    for field_name in archer_payload["fields_to_update"].keys():
-        if field_name not in ARCHER_FIELDS:
-            raise RuntimeError(f"Missing field GUID config for Archer field: {field_name}")
-
-        field_guid = ARCHER_FIELDS[field_name]
-        if not field_guid:
-            raise RuntimeError(f"Empty field GUID config for Archer field: {field_name}")
-
-        fields_needed[field_name] = field_guid
-
-    field_ids = get_archer_field_ids(
-        token=token,
-        application_id=application_id,
-        field_guid_map=fields_needed,
-    )
 
     content_id = find_archer_content_id_by_finding_id(
         token=token,
         application_id=application_id,
-        finding_id_field_id=field_ids["Finding ID"],
+        finding_id_field_id=hardcoded_field_ids["Finding ID"],
         finding_id=archer_payload["finding_id"],
     )
 
     field_contents = build_archer_field_contents_for_text_updates(
-        field_ids=field_ids,
+        field_ids=hardcoded_field_ids,
         fields_to_update=archer_payload["fields_to_update"],
     )
 
