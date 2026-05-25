@@ -787,9 +787,12 @@ def find_archer_content_id_by_finding_id(
 
     for elem in records_root.iter():
         attrs = {k.lower(): v for k, v in elem.attrib.items()}
-        for attr_name, attr_value in attrs.items():
-            if attr_name in {"contentid", "content_id", "id"} and str(attr_value).isdigit():
-                return int(attr_value)
+        # Look specifically for contentId, not just any numeric attribute
+        for attr_name in ["contentid", "content_id"]:
+            if attr_name in attrs and str(attrs[attr_name]).isdigit():
+                content_id = int(attrs[attr_name])
+                if content_id > 10000:  # content IDs are large numbers, field IDs are small
+                    return content_id
 
     raise RuntimeError(
         f"Could not find content ID for {finding_id} in search result."
