@@ -364,15 +364,23 @@ def get_archer_application_by_guid(token: str, application_guid: str) -> Dict[st
     response.raise_for_status()
 
     data = response.json()
-    apps = data.get("RequestedObject", data)
 
-    if isinstance(apps, dict):
-        apps = apps.get("Applications", apps.get("Value", []))
+    # ── Fix: handle both list and dict responses ──────────────────
+    requested = data.get("RequestedObject", data)
 
-    if not isinstance(apps, list):
-        raise RuntimeError(f"Could not parse Archer applications response: {data}")
+    if isinstance(requested, list):
+        apps = requested
+    elif isinstance(requested, dict):
+        apps = requested.get("Applications", requested.get("Value", []))
+        if not isinstance(apps, list):
+            apps = [apps]
+    else:
+        apps = []
+    # ─────────────────────────────────────────────────────────────
 
     for app_item in apps:
+        if not isinstance(app_item, dict):
+            continue
         guid = str(app_item.get("Guid") or app_item.get("GUID") or "").lower()
         if guid == application_guid.lower():
             return app_item
