@@ -669,14 +669,16 @@ def archer_soap_search_records(
     application_id: int,
     finding_id_field_id: int,
     finding_id: str,
+    page_number: int,
+    page_size: int,
 ) -> str:
     url = f"{ARCHER_SOAP_BASE_URL}/search.asmx"
 
     tracking_number = finding_id_to_tracking_number(finding_id)
 
     search_xml = f"""<SearchReport>
-    <PageSize>10</PageSize>
-    <MaxRecordCount>10</MaxRecordCount>
+    <PageSize>{page_size}</PageSize>
+    <MaxRecordCount>{page_size}</MaxRecordCount>
     <ShowStatSummaries>false</ShowStatSummaries>
     <DisplayFields>
         <DisplayField>{finding_id_field_id}</DisplayField>
@@ -706,7 +708,7 @@ def archer_soap_search_records(
     <ExecuteSearch xmlns="http://archer-tech.com/webservices/">
       <sessionToken>{token}</sessionToken>
       <searchOptions>{html.escape(search_xml)}</searchOptions>
-      <pageNumber>1</pageNumber>
+      <pageNumber>{page_number}</pageNumber>
     </ExecuteSearch>
   </soap:Body>
 </soap:Envelope>
@@ -731,7 +733,6 @@ def archer_soap_search_records(
         )
 
     return response.text
-
 
 def find_matching_content_id_in_execute_search_result(
     soap_text: str,
