@@ -1248,35 +1248,18 @@ def debug_archer_login():
 
 @app.route("/debug-archer-fields", methods=["GET"])
 def debug_archer_fields():
-    try:
-        token = archer_login()
-
-        field_ids = get_archer_field_ids(
-            token=token,
-            application_id=FINDINGS_APPLICATION_ID,
-            field_guid_map={
-                "Finding ID": ARCHER_FIELDS["Finding ID"],
-                "Finding": ARCHER_FIELDS["Finding"],
+    return jsonify(
+        {
+            "ok": True,
+            "source": "direct env field IDs",
+            "application_id": get_env_int("FINDINGS_APPLICATION_ID", 167),
+            "level_id": get_env_int("FINDINGS_LEVEL_ID", 62),
+            "field_ids": {
+                "Finding ID": get_env_int("ARCHER_FINDING_ID_FIELD_ID", 2260),
+                "Finding": get_env_int("ARCHER_FINDING_TEXT_FIELD_ID", 2265),
             },
-        )
-
-        return jsonify(
-            {
-                "ok": True,
-                "application_id": FINDINGS_APPLICATION_ID,
-                "field_ids": field_ids,
-            }
-        ), 200
-
-    except Exception as exc:
-        return jsonify(
-            {
-                "ok": False,
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            }
-        ), 500
-
+        }
+    ), 200
 
 @app.route("/debug-find-content/<finding_id>", methods=["GET"])
 def debug_find_content(finding_id: str):
