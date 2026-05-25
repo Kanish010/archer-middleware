@@ -75,8 +75,6 @@ ARCHER_FINDING_ID_FIELD_ID = get_env_int("ARCHER_FINDING_ID_FIELD_ID", 2260)
 ARCHER_FINDING_TEXT_FIELD_ID = get_env_int("ARCHER_FINDING_TEXT_FIELD_ID", 2265)
 
 ARCHER_REVERSE_SYNC_DRY_RUN = get_env_bool("ARCHER_REVERSE_SYNC_DRY_RUN", True)
-ARCHER_SEARCH_PAGE_SIZE = get_env_int("ARCHER_SEARCH_PAGE_SIZE", 500)
-ARCHER_SEARCH_MAX_PAGES = get_env_int("ARCHER_SEARCH_MAX_PAGES", 100)
 
 CORS_ORIGINS = [
     origin.strip()
@@ -159,6 +157,8 @@ def unwrap_payload(data: Any) -> Dict[str, Any]:
         "sys_id",
         "number",
         "archer_finding_id",
+        "archer_content_id",
+        "content_id",
         "finding id",
         "overall_status",
         "archerfindingid",
@@ -284,6 +284,17 @@ def safe_str(value: Any, default: str = "") -> str:
     return text if text else default
 
 
+def safe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+
+    match = re.search(r"\d+", str(value))
+    if not match:
+        return None
+
+    return int(match.group(0))
+
+
 def extract_archer_id_from_text(text: str) -> Optional[str]:
     if not text:
         return None
@@ -295,6 +306,17 @@ def extract_archer_id_from_text(text: str) -> Optional[str]:
     match = re.search(r"\bFND-\d+\b", text, flags=re.IGNORECASE)
     if match:
         return match.group(0).upper()
+
+    return None
+
+
+def extract_archer_content_id_from_text(text: str) -> Optional[int]:
+    if not text:
+        return None
+
+    match = re.search(r"\[ARCHER_CONTENT_ID\s*:\s*(\d+)\]", text, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
 
     return None
 
@@ -372,6 +394,18 @@ def normalize_archer_payload_for_servicenow(payload: Dict[str, Any]) -> Dict[str
         )
     )
 
+    archer_content_id = safe_int(
+        flex_get(
+            payload,
+            "archer_content_id",
+            "archerContentId",
+            "content_id",
+            "contentId",
+            "Content ID",
+            "contentIdValue",
+        )
+    )
+
     finding_text = safe_str(
         flex_get(
             payload,
@@ -409,14 +443,20 @@ def normalize_archer_payload_for_servicenow(payload: Dict[str, Any]) -> Dict[str
 
     short_description = f"Archer Finding {finding_id}"
 
+    content_marker = ""
+    if archer_content_id:
+        content_marker = f"[ARCHER_CONTENT_ID:{archer_content_id}]\n"
+
     description = (
-        f"[ARCHER_ID:{finding_id}]\n\n"
+        f"[ARCHER_ID:{finding_id}]\n"
+        f"{content_marker}\n"
         f"Finding:\n"
         f"{finding_text}"
     )
 
     return {
         "archer_finding_id": finding_id,
+        "archer_content_id": archer_content_id,
         "short_description": short_description,
         "description": description,
         "priority": priority,
@@ -632,7 +672,6 @@ def archer_soap_search_records(
 ) -> str:
     url = f"{ARCHER_SOAP_BASE_URL}/search.asmx"
 
-    # Extract just the numeric part e.g. "1635" from "FND-1635"
     tracking_number = finding_id_to_tracking_number(finding_id)
 
     search_xml = f"""<SearchReport>
@@ -687,72 +726,91 @@ def archer_soap_search_records(
     if not response.ok:
         raise RuntimeError(
             f"Archer SOAP search failed. Status: {response.status_code}. "
-            f"Response preview: {response.text[:2000]}"
+            f"Response preview: {response.text[:2000]}. "
+            f"Search XML: {search_xml}"
         )
 
     return response.text
 
 
-def parse_soap_search_records(
-    soap_response_text: str,
+def find_matching_content_id_in_execute_search_result(
+    soap_text: str,
     finding_id_field_id: int,
-) -> List[Tuple[int, str]]:
-    records: List[Tuple[int, str]] = []
+    finding_id: str,
+) -> int:
+    target_tracking_number = finding_id_to_tracking_number(finding_id)
 
-    try:
-        root = ET.fromstring(soap_response_text)
-    except ET.ParseError:
-        return records
+    root = ET.fromstring(soap_text)
 
-    for elem in root.iter():
-        if not elem.tag.lower().endswith("searchrecordsbyreportresult"):
+    result_node = root.find(
+        ".//{http://archer-tech.com/webservices/}ExecuteSearchResult"
+    )
+
+    if result_node is None or not result_node.text:
+        raise RuntimeError(f"No ExecuteSearchResult returned for {finding_id}")
+
+    inner_xml = html.unescape(result_node.text)
+
+    if not inner_xml.strip():
+        raise RuntimeError(f"Empty ExecuteSearchResult returned for {finding_id}")
+
+    records_root = ET.fromstring(inner_xml)
+
+    debug_records: List[Dict[str, Any]] = []
+
+    for record in records_root.iter():
+        tag_lower = record.tag.lower()
+
+        if not tag_lower.endswith("record"):
             continue
 
-        inner_xml = elem.text or ""
-        inner_xml = html.unescape(inner_xml)
+        attrs = {k.lower(): v for k, v in record.attrib.items()}
 
-        if not inner_xml.strip():
-            continue
-
-        try:
-            records_root = ET.fromstring(inner_xml)
-        except ET.ParseError:
-            continue
-
-        for record in records_root.iter():
-            if not record.tag.lower().endswith("record"):
-                continue
-
-            content_id_raw = (
-                record.attrib.get("contentId")
-                or record.attrib.get("contentid")
-                or record.attrib.get("id")
-            )
-
-            if not content_id_raw:
-                continue
-
-            try:
-                content_id = int(content_id_raw)
-            except ValueError:
-                continue
-
-            finding_id_value = ""
-
-            for field in record.iter():
-                if not field.tag.lower().endswith("field"):
-                    continue
-
-                field_id_raw = field.attrib.get("id") or field.attrib.get("fieldId")
-
-                if str(field_id_raw) == str(finding_id_field_id):
-                    finding_id_value = clean_html_text(field.text or "")
+        content_id = None
+        for key in ["contentid", "content_id", "id"]:
+            value = attrs.get(key)
+            if value and str(value).isdigit():
+                maybe_id = int(value)
+                if maybe_id > 10000:
+                    content_id = maybe_id
                     break
 
-            if finding_id_value:
-                records.append((content_id, finding_id_value))
+        if not content_id:
+            continue
 
-    return records
+        finding_value = ""
+
+        for field in record.iter():
+            if not field.tag.lower().endswith("field"):
+                continue
+
+            field_attrs = {k.lower(): v for k, v in field.attrib.items()}
+            field_id_raw = (
+                field_attrs.get("id")
+                or field_attrs.get("fieldid")
+                or field_attrs.get("field_id")
+            )
+
+            if str(field_id_raw) == str(finding_id_field_id):
+                finding_value = clean_html_text(field.text or "")
+                break
+
+        debug_records.append(
+            {
+                "content_id": content_id,
+                "finding_value": finding_value,
+            }
+        )
+
+        if finding_value.strip() == target_tracking_number:
+            return content_id
+
+    raise RuntimeError(
+        f"Search returned records, but none matched {finding_id}. "
+        f"Expected field {finding_id_field_id} value '{target_tracking_number}'. "
+        f"Records seen: {debug_records[:10]}. "
+        f"Raw inner XML preview: {inner_xml[:2000]}"
+    )
 
 
 def find_archer_content_id_by_finding_id(
@@ -768,35 +826,12 @@ def find_archer_content_id_by_finding_id(
         finding_id=finding_id,
     )
 
-    # Parse ExecuteSearchResult
-    root = ET.fromstring(soap_text)
-
-    result_node = root.find(
-        ".//{http://archer-tech.com/webservices/}ExecuteSearchResult"
+    return find_matching_content_id_in_execute_search_result(
+        soap_text=soap_text,
+        finding_id_field_id=finding_id_field_id,
+        finding_id=finding_id,
     )
 
-    if result_node is None or not result_node.text:
-        raise RuntimeError(f"No search result returned for {finding_id}")
-
-    inner_xml = html.unescape(result_node.text)
-
-    if not inner_xml.strip():
-        raise RuntimeError(f"Empty search result for {finding_id}")
-
-    records_root = ET.fromstring(inner_xml)
-
-    for elem in records_root.iter():
-        attrs = {k.lower(): v for k, v in elem.attrib.items()}
-        # Look specifically for contentId, not just any numeric attribute
-        for attr_name in ["contentid", "content_id"]:
-            if attr_name in attrs and str(attrs[attr_name]).isdigit():
-                content_id = int(attrs[attr_name])
-                if content_id > 10000:  # content IDs are large numbers, field IDs are small
-                    return content_id
-
-    raise RuntimeError(
-        f"Could not find content ID for {finding_id} in search result."
-    )
 
 # ============================================================
 # Reverse sync payload builder
@@ -845,6 +880,21 @@ def normalize_servicenow_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         or extract_archer_id_from_text(short_description)
     )
 
+    archer_content_id = (
+        safe_int(
+            flex_get(
+                payload,
+                "archer_content_id",
+                "archerContentId",
+                "content_id",
+                "contentId",
+                "Content ID",
+            )
+        )
+        or extract_archer_content_id_from_text(description)
+        or extract_archer_content_id_from_text(short_description)
+    )
+
     if not archer_finding_id:
         raise ValueError(
             "Could not find Archer Finding ID. "
@@ -858,6 +908,7 @@ def normalize_servicenow_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "archer_finding_id": archer_finding_id.upper(),
+        "archer_content_id": archer_content_id,
         "short_description": short_description,
         "description": description,
         "state": safe_str(flex_get(payload, "state", "State", "status", "Status")),
@@ -874,6 +925,7 @@ def build_archer_reverse_payload(sn_data: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "finding_id": sn_data["archer_finding_id"],
+        "content_id": sn_data.get("archer_content_id"),
         "fields_to_update": {
             "Finding": finding_text,
         },
@@ -889,12 +941,18 @@ def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
         "Finding": ARCHER_FINDING_TEXT_FIELD_ID,
     }
 
-    content_id = find_archer_content_id_by_finding_id(
-        token=token,
-        application_id=FINDINGS_APPLICATION_ID,
-        finding_id_field_id=field_ids["Finding ID"],
-        finding_id=archer_payload["finding_id"],
-    )
+    content_id = safe_int(archer_payload.get("content_id"))
+
+    content_id_source = "servicenow_payload_or_marker"
+
+    if not content_id:
+        content_id_source = "verified_archer_search"
+        content_id = find_archer_content_id_by_finding_id(
+            token=token,
+            application_id=FINDINGS_APPLICATION_ID,
+            finding_id_field_id=field_ids["Finding ID"],
+            finding_id=archer_payload["finding_id"],
+        )
 
     field_contents = build_archer_field_contents_for_text_updates(
         field_ids=field_ids,
@@ -916,6 +974,7 @@ def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
         "message": "Archer update completed.",
         "finding_id": archer_payload["finding_id"],
         "archer_content_id": content_id,
+        "content_id_source": content_id_source,
         "field_contents_sent": field_contents,
         "update_result": update_result,
     }
@@ -978,6 +1037,7 @@ def archer_to_servicenow():
                     "ok": True,
                     "action": "updated",
                     "archer_finding_id": sn_payload["archer_finding_id"],
+                    "archer_content_id": sn_payload["archer_content_id"],
                     "servicenow_sys_id": sys_id,
                     "servicenow_response": result,
                 }
@@ -991,6 +1051,7 @@ def archer_to_servicenow():
                 "ok": True,
                 "action": "created",
                 "archer_finding_id": sn_payload["archer_finding_id"],
+                "archer_content_id": sn_payload["archer_content_id"],
                 "servicenow_sys_id": created_record.get("sys_id"),
                 "servicenow_response": result,
             }
@@ -1085,7 +1146,6 @@ def debug_env():
         "ARCHER_INSTANCE_NAME",
         "ARCHER_USERNAME",
         "ARCHER_PASSWORD",
-        "FINDINGS_APPLICATION_GUID",
         "FINDINGS_APPLICATION_ID",
         "FINDINGS_LEVEL_ID",
         "ARCHER_FINDING_ID_FIELD_ID",
