@@ -639,7 +639,7 @@ def archer_soap_search_records(
   <PageSize>{page_size}</PageSize>
   <MaxRecordCount>{max_record_count}</MaxRecordCount>
   <DisplayFields>
-    <DisplayField>{finding_id_field_id}</DisplayField>
+    <DisplayField>{application_id}</DisplayField>
   </DisplayFields>
   <Criteria>
     <ModuleCriteria>
