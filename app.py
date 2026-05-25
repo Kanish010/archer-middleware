@@ -69,6 +69,10 @@ REQUEST_TIMEOUT_SECONDS = get_env_int("REQUEST_TIMEOUT_SECONDS", 30)
 
 FINDINGS_APPLICATION_GUID = get_env_required("FINDINGS_APPLICATION_GUID")
 FINDINGS_APPLICATION_ID = get_env_int("FINDINGS_APPLICATION_ID", 167)
+FINDINGS_LEVEL_ID = get_env_int("FINDINGS_LEVEL_ID", 62)
+
+ARCHER_FINDING_ID_FIELD_ID = get_env_int("ARCHER_FINDING_ID_FIELD_ID", 2260)
+ARCHER_FINDING_TEXT_FIELD_ID = get_env_int("ARCHER_FINDING_TEXT_FIELD_ID", 2265)
 
 ARCHER_REVERSE_SYNC_DRY_RUN = get_env_bool("ARCHER_REVERSE_SYNC_DRY_RUN", True)
 ARCHER_SEARCH_PAGE_SIZE = get_env_int("ARCHER_SEARCH_PAGE_SIZE", 500)
@@ -81,8 +85,8 @@ CORS_ORIGINS = [
 ]
 
 ARCHER_FIELDS = {
-    "Finding ID": get_env_required("ARCHER_FIELD_FINDING_ID_GUID"),
-    "Finding": get_env_required("ARCHER_FIELD_FINDING_GUID"),
+    "Finding ID": get_env_optional("ARCHER_FIELD_FINDING_ID_GUID", ""),
+    "Finding": get_env_optional("ARCHER_FIELD_FINDING_GUID", ""),
     "Overall Status": get_env_optional("ARCHER_FIELD_OVERALL_STATUS_GUID", ""),
     "Response": get_env_optional("ARCHER_FIELD_RESPONSE_GUID", ""),
     "Assigned To": get_env_optional("ARCHER_FIELD_ASSIGNED_TO_GUID", ""),
@@ -142,10 +146,6 @@ def parse_json_if_string(value: Any) -> Any:
 
 
 def unwrap_payload(data: Any) -> Dict[str, Any]:
-    """
-    Recursively unwraps common wrappers used by Archer, ServiceNow,
-    webhooks, test tools, and proxy layers.
-    """
     data = parse_json_if_string(data)
 
     if not isinstance(data, dict):
@@ -190,13 +190,6 @@ def unwrap_payload(data: Any) -> Dict[str, Any]:
 
 
 def parse_inbound_request() -> Dict[str, Any]:
-    """
-    Robustly parse incoming request body from:
-    - JSON body
-    - form data
-    - raw JSON string
-    - wrapped/stringified JSON
-    """
     payload: Any = None
 
     try:
@@ -244,16 +237,6 @@ def normalize_key(key: Any) -> str:
 
 
 def flex_get(data: Dict[str, Any], *candidate_keys: str, default: Any = None) -> Any:
-    """
-    Flexible key lookup.
-
-    Handles:
-    - finding_id
-    - Finding ID
-    - findingId
-    - archerFindingId
-    - nested dictionaries
-    """
     if not isinstance(data, dict):
         return default
 
@@ -524,7 +507,6 @@ def archer_headers(token: Optional[str] = None) -> Dict[str, str]:
     }
 
     if token:
-        # Important: do not wrap token in quotes.
         headers["Authorization"] = f"Archer session-id={token}"
 
     return headers
@@ -570,72 +552,6 @@ def archer_login() -> str:
     return token
 
 
-def get_archer_field_ids(
-    token: str,
-    application_id: int,
-    field_guid_map: Dict[str, str],
-) -> Dict[str, int]:
-    url = f"{ARCHER_API_BASE_URL}/core/system/fielddefinition/application/{application_id}"
-
-    response = requests.get(
-        url,
-        headers=archer_headers(token),
-        verify=VERIFY_SSL,
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if isinstance(data, list):
-        fields = data
-    elif isinstance(data, dict):
-        requested = data.get("RequestedObject", data)
-        if isinstance(requested, list):
-            fields = requested
-        elif isinstance(requested, dict):
-            fields = requested.get("FieldDefinitions", requested.get("Value", []))
-            if not isinstance(fields, list):
-                fields = [fields]
-        else:
-            fields = []
-    else:
-        fields = []
-
-    result: Dict[str, int] = {}
-
-    for logical_name, target_guid in field_guid_map.items():
-        if not target_guid:
-            continue
-
-        matched_field = None
-
-        for field in fields:
-            if not isinstance(field, dict):
-                continue
-
-            field_guid = str(field.get("Guid") or field.get("GUID") or "").lower()
-
-            if field_guid == target_guid.lower():
-                matched_field = field
-                break
-
-        if not matched_field:
-            raise RuntimeError(
-                f"Could not find Archer field '{logical_name}' with GUID {target_guid}"
-            )
-
-        field_id = matched_field.get("Id") or matched_field.get("ID")
-
-        if field_id is None:
-            raise RuntimeError(f"Matched Archer field '{logical_name}' but no Id found.")
-
-        result[logical_name] = int(field_id)
-
-    return result
-
-
 def build_archer_field_contents_for_text_updates(
     field_ids: Dict[str, int],
     fields_to_update: Dict[str, str],
@@ -661,14 +577,8 @@ def try_archer_content_update(
     token: str,
     content_id: int,
     field_contents: Dict[str, Dict[str, Any]],
-    level_id: int = 62,
+    level_id: int = FINDINGS_LEVEL_ID,
 ) -> Dict[str, Any]:
-    """
-    Correct Archer content update body.
-
-    Do not change this back to RequestedObject.
-    Archer accepted the Content wrapper format.
-    """
     body = {
         "Content": {
             "Id": content_id,
@@ -968,14 +878,12 @@ def build_archer_reverse_payload(sn_data: Dict[str, Any]) -> Dict[str, Any]:
 def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
     token = archer_login()
 
-    application_id = get_env_int("FINDINGS_APPLICATION_ID", 167)
-    level_id = get_env_int("FINDINGS_LEVEL_ID", 62)
+    application_id = FINDINGS_APPLICATION_ID
+    level_id = FINDINGS_LEVEL_ID
 
-    # Use direct Archer field IDs instead of resolving GUIDs.
-    # This avoids the failing get_archer_field_ids() call.
     field_ids = {
-        "Finding ID": get_env_int("ARCHER_FINDING_ID_FIELD_ID", 2260),
-        "Finding": get_env_int("ARCHER_FINDING_TEXT_FIELD_ID", 2265),
+        "Finding ID": ARCHER_FINDING_ID_FIELD_ID,
+        "Finding": ARCHER_FINDING_TEXT_FIELD_ID,
     }
 
     content_id = find_archer_content_id_by_finding_id(
@@ -1008,6 +916,7 @@ def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
         "field_contents_sent": field_contents,
         "update_result": update_result,
     }
+
 
 # ============================================================
 # Routes
@@ -1175,6 +1084,9 @@ def debug_env():
         "ARCHER_PASSWORD",
         "FINDINGS_APPLICATION_GUID",
         "FINDINGS_APPLICATION_ID",
+        "FINDINGS_LEVEL_ID",
+        "ARCHER_FINDING_ID_FIELD_ID",
+        "ARCHER_FINDING_TEXT_FIELD_ID",
         "ARCHER_FIELD_FINDING_ID_GUID",
         "ARCHER_FIELD_FINDING_GUID",
         "ARCHER_REVERSE_SYNC_DRY_RUN",
@@ -1252,32 +1164,25 @@ def debug_archer_fields():
         {
             "ok": True,
             "source": "direct env field IDs",
-            "application_id": get_env_int("FINDINGS_APPLICATION_ID", 167),
-            "level_id": get_env_int("FINDINGS_LEVEL_ID", 62),
+            "application_id": FINDINGS_APPLICATION_ID,
+            "level_id": FINDINGS_LEVEL_ID,
             "field_ids": {
-                "Finding ID": get_env_int("ARCHER_FINDING_ID_FIELD_ID", 2260),
-                "Finding": get_env_int("ARCHER_FINDING_TEXT_FIELD_ID", 2265),
+                "Finding ID": ARCHER_FINDING_ID_FIELD_ID,
+                "Finding": ARCHER_FINDING_TEXT_FIELD_ID,
             },
         }
     ), 200
+
 
 @app.route("/debug-find-content/<finding_id>", methods=["GET"])
 def debug_find_content(finding_id: str):
     try:
         token = archer_login()
 
-        field_ids = get_archer_field_ids(
-            token=token,
-            application_id=FINDINGS_APPLICATION_ID,
-            field_guid_map={
-                "Finding ID": ARCHER_FIELDS["Finding ID"],
-            },
-        )
-
         content_id = find_archer_content_id_by_finding_id(
             token=token,
             application_id=FINDINGS_APPLICATION_ID,
-            finding_id_field_id=field_ids["Finding ID"],
+            finding_id_field_id=ARCHER_FINDING_ID_FIELD_ID,
             finding_id=finding_id,
         )
 
@@ -1285,7 +1190,8 @@ def debug_find_content(finding_id: str):
             {
                 "ok": True,
                 "finding_id": finding_id,
-                "finding_id_field_id": field_ids["Finding ID"],
+                "application_id": FINDINGS_APPLICATION_ID,
+                "finding_id_field_id": ARCHER_FINDING_ID_FIELD_ID,
                 "content_id": content_id,
             }
         ), 200
