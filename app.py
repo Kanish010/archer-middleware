@@ -968,28 +968,15 @@ def build_archer_reverse_payload(sn_data: Dict[str, Any]) -> Dict[str, Any]:
 def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
     token = archer_login()
 
-    application_id = FINDINGS_APPLICATION_ID
+    application_id = get_env_int("FINDINGS_APPLICATION_ID", 167)
+    level_id = get_env_int("FINDINGS_LEVEL_ID", 62)
 
-    fields_needed = {
-        "Finding ID": ARCHER_FIELDS["Finding ID"],
+    # Use direct Archer field IDs instead of resolving GUIDs.
+    # This avoids the failing get_archer_field_ids() call.
+    field_ids = {
+        "Finding ID": get_env_int("ARCHER_FINDING_ID_FIELD_ID", 2260),
+        "Finding": get_env_int("ARCHER_FINDING_TEXT_FIELD_ID", 2265),
     }
-
-    for field_name in archer_payload["fields_to_update"].keys():
-        if field_name not in ARCHER_FIELDS:
-            raise RuntimeError(f"Missing field GUID config for Archer field: {field_name}")
-
-        field_guid = ARCHER_FIELDS[field_name]
-
-        if not field_guid:
-            raise RuntimeError(f"Empty field GUID config for Archer field: {field_name}")
-
-        fields_needed[field_name] = field_guid
-
-    field_ids = get_archer_field_ids(
-        token=token,
-        application_id=application_id,
-        field_guid_map=fields_needed,
-    )
 
     content_id = find_archer_content_id_by_finding_id(
         token=token,
@@ -1007,6 +994,7 @@ def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
         token=token,
         content_id=content_id,
         field_contents=field_contents,
+        level_id=level_id,
     )
 
     if not update_result.get("success"):
@@ -1020,7 +1008,6 @@ def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
         "field_contents_sent": field_contents,
         "update_result": update_result,
     }
-
 
 # ============================================================
 # Routes
