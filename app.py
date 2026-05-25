@@ -628,37 +628,47 @@ def archer_soap_search_records(
     token: str,
     application_id: int,
     finding_id_field_id: int,
-    page_number: int,
-    page_size: int,
-    max_record_count: int,
+    finding_id: str,
 ) -> str:
     url = f"{ARCHER_SOAP_BASE_URL}/search.asmx"
 
-    search_xml = f"""
-<SearchReport>
-  <PageSize>{page_size}</PageSize>
-  <MaxRecordCount>{max_record_count}</MaxRecordCount>
-  <DisplayFields>
-    <DisplayField>{application_id}</DisplayField>
-  </DisplayFields>
-  <Criteria>
-    <ModuleCriteria>
-      <ApplicationId>{application_id}</ApplicationId>
-    </ModuleCriteria>
-  </Criteria>
-</SearchReport>
-""".strip()
+    # Extract just the numeric part e.g. "1635" from "FND-1635"
+    tracking_number = finding_id_to_tracking_number(finding_id)
+
+    search_xml = f"""<SearchReport>
+    <PageSize>10</PageSize>
+    <MaxRecordCount>10</MaxRecordCount>
+    <ShowStatSummaries>false</ShowStatSummaries>
+    <DisplayFields>
+        <DisplayField>{finding_id_field_id}</DisplayField>
+    </DisplayFields>
+    <Criteria>
+        <ModuleCriteria>
+            <Module>{application_id}</Module>
+            <IsKeywordModule>false</IsKeywordModule>
+            <Filter>
+                <Conditions>
+                    <TextFilterCondition>
+                        <Field>{finding_id_field_id}</Field>
+                        <Operator>Equals</Operator>
+                        <Value>{tracking_number}</Value>
+                    </TextFilterCondition>
+                </Conditions>
+            </Filter>
+        </ModuleCriteria>
+    </Criteria>
+</SearchReport>""".strip()
 
     soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema"
                xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
-    <SearchRecordsByReport xmlns="http://archer-tech.com/webservices/">
+    <ExecuteSearch xmlns="http://archer-tech.com/webservices/">
       <sessionToken>{token}</sessionToken>
-      <pageNumber>{page_number}</pageNumber>
-      <searchReport>{html.escape(search_xml)}</searchReport>
-    </SearchRecordsByReport>
+      <searchOptions>{html.escape(search_xml)}</searchOptions>
+      <pageNumber>1</pageNumber>
+    </ExecuteSearch>
   </soap:Body>
 </soap:Envelope>
 """
@@ -667,7 +677,7 @@ def archer_soap_search_records(
         url,
         headers={
             "Content-Type": "text/xml; charset=utf-8",
-            "SOAPAction": "http://archer-tech.com/webservices/SearchRecordsByReport",
+            "SOAPAction": '"http://archer-tech.com/webservices/ExecuteSearch"',
         },
         data=soap_body.encode("utf-8"),
         verify=VERIFY_SSL,
@@ -676,10 +686,8 @@ def archer_soap_search_records(
 
     if not response.ok:
         raise RuntimeError(
-            "Archer SOAP search failed. "
-            f"Status: {response.status_code}. "
-            f"Response preview: {response.text[:2000]}. "
-            f"Search XML: {search_xml}"
+            f"Archer SOAP search failed. Status: {response.status_code}. "
+            f"Response preview: {response.text[:2000]}"
         )
 
     return response.text
@@ -753,39 +761,39 @@ def find_archer_content_id_by_finding_id(
     finding_id_field_id: int,
     finding_id: str,
 ) -> int:
-    target_tracking_number = finding_id_to_tracking_number(finding_id)
-
-    page_size = ARCHER_SEARCH_PAGE_SIZE
-    max_pages = ARCHER_SEARCH_MAX_PAGES
-    max_record_count = page_size * max_pages
-
-    for page_number in range(1, max_pages + 1):
-        soap_text = archer_soap_search_records(
-            token=token,
-            application_id=application_id,
-            finding_id_field_id=finding_id_field_id,
-            page_number=page_number,
-            page_size=page_size,
-            max_record_count=max_record_count,
-        )
-
-        records = parse_soap_search_records(
-            soap_response_text=soap_text,
-            finding_id_field_id=finding_id_field_id,
-        )
-
-        if not records:
-            break
-
-        for content_id, field_value in records:
-            if field_value.strip() == target_tracking_number:
-                return content_id
-
-    raise RuntimeError(
-        f"Could not find Archer content ID for {finding_id}. "
-        f"Looked for numeric Finding ID value '{target_tracking_number}'."
+    soap_text = archer_soap_search_records(
+        token=token,
+        application_id=application_id,
+        finding_id_field_id=finding_id_field_id,
+        finding_id=finding_id,
     )
 
+    # Parse ExecuteSearchResult
+    root = ET.fromstring(soap_text)
+
+    result_node = root.find(
+        ".//{http://archer-tech.com/webservices/}ExecuteSearchResult"
+    )
+
+    if result_node is None or not result_node.text:
+        raise RuntimeError(f"No search result returned for {finding_id}")
+
+    inner_xml = html.unescape(result_node.text)
+
+    if not inner_xml.strip():
+        raise RuntimeError(f"Empty search result for {finding_id}")
+
+    records_root = ET.fromstring(inner_xml)
+
+    for elem in records_root.iter():
+        attrs = {k.lower(): v for k, v in elem.attrib.items()}
+        for attr_name, attr_value in attrs.items():
+            if attr_name in {"contentid", "content_id", "id"} and str(attr_value).isdigit():
+                return int(attr_value)
+
+    raise RuntimeError(
+        f"Could not find content ID for {finding_id} in search result."
+    )
 
 # ============================================================
 # Reverse sync payload builder
