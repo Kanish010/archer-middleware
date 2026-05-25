@@ -6,7 +6,7 @@ import os
 import re
 import traceback
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -67,7 +67,6 @@ ARCHER_PASSWORD = get_env_required("ARCHER_PASSWORD")
 VERIFY_SSL = get_env_bool("VERIFY_SSL", True)
 REQUEST_TIMEOUT_SECONDS = get_env_int("REQUEST_TIMEOUT_SECONDS", 30)
 
-FINDINGS_APPLICATION_GUID = get_env_optional("FINDINGS_APPLICATION_GUID", "")
 FINDINGS_APPLICATION_ID = get_env_int("FINDINGS_APPLICATION_ID", 167)
 FINDINGS_LEVEL_ID = get_env_int("FINDINGS_LEVEL_ID", 62)
 
@@ -96,7 +95,7 @@ else:
 
 
 # ============================================================
-# Robust payload parsing
+# Payload parsing helpers
 # ============================================================
 
 WRAPPER_KEYS = {
@@ -163,6 +162,7 @@ def unwrap_payload(data: Any) -> Dict[str, Any]:
         "overall_status",
         "archerfindingid",
         "findingtext",
+        "contentid",
     }
 
     for key, value in list(data.items()):
@@ -661,7 +661,7 @@ def try_archer_content_update(
 
 
 # ============================================================
-# Archer SOAP search helpers
+# Optional fallback Archer SOAP search
 # ============================================================
 
 def archer_soap_search_records(
@@ -669,8 +669,8 @@ def archer_soap_search_records(
     application_id: int,
     finding_id_field_id: int,
     finding_id: str,
-    page_number: int,
-    page_size: int,
+    page_number: int = 1,
+    page_size: int = 500,
 ) -> str:
     url = f"{ARCHER_SOAP_BASE_URL}/search.asmx"
 
@@ -734,6 +734,7 @@ def archer_soap_search_records(
 
     return response.text
 
+
 def find_matching_content_id_in_execute_search_result(
     soap_text: str,
     finding_id_field_id: int,
@@ -760,9 +761,7 @@ def find_matching_content_id_in_execute_search_result(
     debug_records: List[Dict[str, Any]] = []
 
     for record in records_root.iter():
-        tag_lower = record.tag.lower()
-
-        if not tag_lower.endswith("record"):
+        if not record.tag.lower().endswith("record"):
             continue
 
         attrs = {k.lower(): v for k, v in record.attrib.items()}
@@ -809,8 +808,7 @@ def find_matching_content_id_in_execute_search_result(
     raise RuntimeError(
         f"Search returned records, but none matched {finding_id}. "
         f"Expected field {finding_id_field_id} value '{target_tracking_number}'. "
-        f"Records seen: {debug_records[:10]}. "
-        f"Raw inner XML preview: {inner_xml[:2000]}"
+        f"Records seen: {debug_records[:10]}."
     )
 
 
@@ -820,8 +818,8 @@ def find_archer_content_id_by_finding_id(
     finding_id_field_id: int,
     finding_id: str,
 ) -> int:
+    max_pages = get_env_int("ARCHER_SEARCH_MAX_PAGES", 5)
     page_size = get_env_int("ARCHER_SEARCH_PAGE_SIZE", 500)
-    max_pages = get_env_int("ARCHER_SEARCH_MAX_PAGES", 20)
 
     errors_seen = []
 
@@ -842,20 +840,15 @@ def find_archer_content_id_by_finding_id(
                 finding_id=finding_id,
             )
         except RuntimeError as exc:
-            error_text = str(exc)
-            errors_seen.append(f"Page {page_number}: {error_text[:500]}")
-
-            # If the page has fewer/no records, stop early.
-            if "Records seen: []" in error_text or "Empty ExecuteSearchResult" in error_text:
-                break
-
+            errors_seen.append(f"Page {page_number}: {str(exc)[:400]}")
             continue
 
     raise RuntimeError(
-        f"Could not find Archer content ID for {finding_id} after searching "
-        f"{max_pages} pages of {page_size} records. "
-        f"Last errors: {errors_seen[-3:]}"
+        f"Could not find Archer content ID for {finding_id}. "
+        f"ServiceNow payload should include [ARCHER_CONTENT_ID:xxxxx]. "
+        f"Fallback SOAP search failed. Last errors: {errors_seen[-3:]}"
     )
+
 
 # ============================================================
 # Reverse sync payload builder
@@ -966,11 +959,10 @@ def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     content_id = safe_int(archer_payload.get("content_id"))
-
     content_id_source = "servicenow_payload_or_marker"
 
     if not content_id:
-        content_id_source = "verified_archer_search"
+        content_id_source = "fallback_verified_archer_search"
         content_id = find_archer_content_id_by_finding_id(
             token=token,
             application_id=FINDINGS_APPLICATION_ID,
@@ -1023,7 +1015,7 @@ def root():
                 "/debug-servicenow",
                 "/debug-archer-login",
                 "/debug-archer-fields",
-                "/debug-find-content/FND-1635",
+                "/debug-find-content/FND-1024",
                 "/debug-echo",
             ],
         }
