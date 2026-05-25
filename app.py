@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json as json_module
 import os
 import re
 import traceback
@@ -67,6 +68,7 @@ VERIFY_SSL = get_env_bool("VERIFY_SSL", True)
 REQUEST_TIMEOUT_SECONDS = get_env_int("REQUEST_TIMEOUT_SECONDS", 30)
 
 FINDINGS_APPLICATION_GUID = get_env_required("FINDINGS_APPLICATION_GUID")
+FINDINGS_APPLICATION_ID = get_env_int("FINDINGS_APPLICATION_ID", 167)
 
 ARCHER_REVERSE_SYNC_DRY_RUN = get_env_bool("ARCHER_REVERSE_SYNC_DRY_RUN", True)
 ARCHER_SEARCH_PAGE_SIZE = get_env_int("ARCHER_SEARCH_PAGE_SIZE", 500)
@@ -102,26 +104,144 @@ else:
 
 
 # ============================================================
-# General helpers
+# Robust payload parsing
 # ============================================================
 
-def safe_get(data: Any, key: str, default: Any = None) -> Any:
-    """Safely call .get() — returns default if data is not a dict."""
-    if isinstance(data, dict):
-        return data.get(key, default)
+WRAPPER_KEYS = {
+    "payload", "data", "record", "current", "body",
+    "request", "result", "requestedobject", "content",
+    "fields", "values",
+}
+
+
+def parse_inbound_request() -> Dict[str, Any]:
+    """
+    Robustly parse the inbound request body.
+    Handles: JSON, form data, raw body, stringified JSON.
+    """
+    # Try normal JSON first
+    payload = request.get_json(force=True, silent=True)
+
+    if payload is not None:
+        return unwrap_payload(payload)
+
+    # Try form data
+    if request.form:
+        form_dict = dict(request.form)
+        # Check if any form value is stringified JSON
+        for key, value in form_dict.items():
+            if isinstance(value, str) and value.strip().startswith("{"):
+                try:
+                    parsed = json_module.loads(value)
+                    if isinstance(parsed, dict):
+                        return unwrap_payload(parsed)
+                except (json_module.JSONDecodeError, ValueError):
+                    pass
+        return unwrap_payload(form_dict)
+
+    # Try raw body
+    raw = request.get_data(as_text=True)
+    if raw and raw.strip():
+        # Try parsing as JSON
+        try:
+            parsed = json_module.loads(raw.strip())
+            if isinstance(parsed, dict):
+                return unwrap_payload(parsed)
+        except (json_module.JSONDecodeError, ValueError):
+            pass
+
+    raise ValueError("Could not parse request body as JSON.")
+
+
+def unwrap_payload(data: Any) -> Dict[str, Any]:
+    """
+    Recursively unwrap common wrapper keys like payload, data,
+    record, current, body, request, result, RequestedObject.
+    Also handles stringified JSON values.
+    """
+    if not isinstance(data, dict):
+        return data if isinstance(data, dict) else {}
+
+    # Check if any value is stringified JSON and parse it
+    for key, value in list(data.items()):
+        if isinstance(value, str) and value.strip().startswith("{"):
+            try:
+                parsed = json_module.loads(value)
+                if isinstance(parsed, dict):
+                    data[key] = parsed
+            except (json_module.JSONDecodeError, ValueError):
+                pass
+
+    # If the dict has exactly one key and it's a wrapper key, unwrap it
+    if len(data) == 1:
+        only_key = list(data.keys())[0]
+        if only_key.lower() in WRAPPER_KEYS:
+            inner = data[only_key]
+            if isinstance(inner, dict):
+                return unwrap_payload(inner)
+
+    # If the dict has a wrapper key whose value is a dict with more
+    # useful-looking keys than the outer dict, prefer the inner
+    for key in list(data.keys()):
+        if key.lower() in WRAPPER_KEYS and isinstance(data[key], dict):
+            inner = data[key]
+            # Only unwrap if the inner dict has content-like keys
+            inner_keys_lower = {k.lower() for k in inner.keys()}
+            content_signals = {
+                "finding_id", "finding", "description", "short_description",
+                "state", "priority", "sys_id", "number", "archer_finding_id",
+                "finding id", "overall_status",
+            }
+            if inner_keys_lower & content_signals:
+                return unwrap_payload(inner)
+
+    return data
+
+
+def flex_get(data: Dict[str, Any], *candidate_keys: str, default: Any = None) -> Any:
+    """
+    Flexible key lookup that normalizes key names.
+    flex_get(d, "finding_id", "Finding ID", "findingId", "archerFindingId")
+    will match any of those keys regardless of case/format.
+    """
+    if not isinstance(data, dict):
+        return default
+
+    # Build a normalized lookup: strip, lowercase, remove _ and spaces
+    def normalize(k: str) -> str:
+        return re.sub(r"[\s_\-]", "", k.lower())
+
+    normalized_data = {normalize(k): v for k, v in data.items()}
+
+    for candidate in candidate_keys:
+        # Direct match first
+        if candidate in data:
+            val = data[candidate]
+            if val is not None and str(val).strip():
+                return val
+
+        # Normalized match
+        norm_candidate = normalize(candidate)
+        if norm_candidate in normalized_data:
+            val = normalized_data[norm_candidate]
+            if val is not None and str(val).strip():
+                return val
+
     return default
 
+
+# ============================================================
+# General helpers
+# ============================================================
 
 def clean_html_text(value: Any) -> str:
     if value is None:
         return ""
 
     text = str(value)
-
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</p\s*>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
-
     text = html.unescape(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -208,21 +328,21 @@ def servicenow_table_url() -> str:
 
 def normalize_archer_payload_for_servicenow(payload: Dict[str, Any]) -> Dict[str, Any]:
     finding_id = safe_str(
-        payload.get("finding_id")
-        or payload.get("Finding ID")
-        or payload.get("archer_finding_id")
-        or payload.get("id")
+        flex_get(payload, "finding_id", "Finding ID", "archer_finding_id",
+                 "archerFindingId", "id", "FND ID")
     )
 
     finding_text = safe_str(
-        payload.get("finding")
-        or payload.get("Finding")
-        or payload.get("description")
-        or payload.get("Description")
+        flex_get(payload, "finding", "Finding", "description", "Description",
+                 "findingText", "finding_text")
     )
 
-    priority = safe_str(payload.get("priority") or payload.get("Priority"), "3")
-    state = safe_str(payload.get("state") or payload.get("State"), "Open")
+    priority = safe_str(
+        flex_get(payload, "priority", "Priority") or "3"
+    )
+    state = safe_str(
+        flex_get(payload, "state", "State", "overall_status", "Overall Status") or "Open"
+    )
 
     if not finding_id:
         raise ValueError("Missing finding_id in Archer payload.")
@@ -321,7 +441,7 @@ def archer_headers(token: Optional[str] = None) -> Dict[str, str]:
     }
 
     if token:
-        headers["Authorization"] = f"Archer session-id={token}"
+        headers["Authorization"] = f'Archer session-id="{token}"'
 
     return headers
 
@@ -337,7 +457,10 @@ def archer_login() -> str:
 
     response = requests.post(
         url,
-        headers=archer_headers(),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
         json=body,
         verify=VERIFY_SSL,
         timeout=REQUEST_TIMEOUT_SECONDS,
@@ -347,56 +470,18 @@ def archer_login() -> str:
 
     data = response.json()
 
-    token = (
-        safe_get(safe_get(data, "RequestedObject", {}), "SessionToken")
-        or safe_get(data, "SessionToken")
-        or safe_get(data, "sessionToken")
-    )
+    if isinstance(data, dict):
+        token = (
+            (data.get("RequestedObject") or {}).get("SessionToken")
+            if isinstance(data.get("RequestedObject"), dict) else None
+        ) or data.get("SessionToken") or data.get("sessionToken")
+    else:
+        token = None
 
     if not token:
         raise RuntimeError(f"Archer login succeeded but no token found. Response: {data}")
 
     return token
-
-
-def get_archer_application_by_guid(token: str, application_guid: str) -> Dict[str, Any]:
-    url = f"{ARCHER_API_BASE_URL}/core/system/application"
-
-    response = requests.get(
-        url,
-        headers=archer_headers(token),
-        verify=VERIFY_SSL,
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    # Handle both list and dict responses from Archer
-    if isinstance(data, list):
-        apps = data
-    elif isinstance(data, dict):
-        requested = data.get("RequestedObject", data)
-        if isinstance(requested, list):
-            apps = requested
-        elif isinstance(requested, dict):
-            apps = requested.get("Applications", requested.get("Value", []))
-            if not isinstance(apps, list):
-                apps = [apps]
-        else:
-            apps = []
-    else:
-        apps = []
-
-    for app_item in apps:
-        if not isinstance(app_item, dict):
-            continue
-        guid = str(app_item.get("Guid") or app_item.get("GUID") or "").lower()
-        if guid == application_guid.lower():
-            return app_item
-
-    raise RuntimeError(f"Could not find Archer application with GUID: {application_guid}")
 
 
 def get_archer_field_ids(
@@ -417,7 +502,7 @@ def get_archer_field_ids(
 
     data = response.json()
 
-    # Handle both list and dict responses from Archer
+    # Handle both list and dict responses
     if isinstance(data, list):
         fields = data
     elif isinstance(data, dict):
@@ -490,6 +575,9 @@ def try_archer_content_update(
     field_contents: Dict[str, Dict[str, Any]],
     level_id: int = 62,
 ) -> Dict[str, Any]:
+    """
+    Try updating Archer content. Uses the correct Content wrapper format.
+    """
     body = {
         "Content": {
             "Id": content_id,
@@ -708,20 +796,15 @@ def find_archer_content_id_by_finding_id(
 
 def normalize_servicenow_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     description = safe_str(
-        payload.get("description")
-        or payload.get("Description")
-        or payload.get("comments")
-        or payload.get("work_notes")
+        flex_get(payload, "description", "Description", "comments", "work_notes")
     )
 
     short_description = safe_str(
-        payload.get("short_description")
-        or payload.get("Short description")
-        or payload.get("title")
+        flex_get(payload, "short_description", "Short description", "title")
     )
 
     archer_finding_id = (
-        safe_str(payload.get("archer_finding_id"))
+        safe_str(flex_get(payload, "archer_finding_id", "archerFindingId"))
         or extract_archer_id_from_text(description)
         or extract_archer_id_from_text(short_description)
     )
@@ -735,8 +818,8 @@ def normalize_servicenow_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "archer_finding_id": archer_finding_id.upper(),
         "short_description": short_description,
         "description": description,
-        "state": safe_str(payload.get("state") or payload.get("State")),
-        "priority": safe_str(payload.get("priority") or payload.get("Priority")),
+        "state": safe_str(flex_get(payload, "state", "State")),
+        "priority": safe_str(flex_get(payload, "priority", "Priority")),
         "raw": payload,
     }
 
@@ -759,12 +842,9 @@ def build_archer_reverse_payload(sn_data: Dict[str, Any]) -> Dict[str, Any]:
 def update_archer_record_real(archer_payload: Dict[str, Any]) -> Dict[str, Any]:
     token = archer_login()
 
-    findings_app = get_archer_application_by_guid(
-        token=token,
-        application_guid=FINDINGS_APPLICATION_GUID,
-    )
-
-    application_id = int(findings_app["Id"])
+    # Use the known application ID directly instead of looking it up by GUID.
+    # This avoids the GUID-matching issue entirely.
+    application_id = FINDINGS_APPLICATION_ID
 
     fields_needed = {
         "Finding ID": ARCHER_FIELDS["Finding ID"],
@@ -847,10 +927,7 @@ def health():
 @app.route("/archer-to-servicenow", methods=["POST"])
 def archer_to_servicenow():
     try:
-        payload = request.get_json(force=True, silent=False)
-
-        if not isinstance(payload, dict):
-            return jsonify({"ok": False, "error": "Expected JSON object."}), 400
+        payload = parse_inbound_request()
 
         sn_payload = normalize_archer_payload_for_servicenow(payload)
 
@@ -909,10 +986,7 @@ def archer_to_servicenow():
 @app.route("/servicenow-to-archer", methods=["POST"])
 def servicenow_to_archer():
     try:
-        payload = request.get_json(force=True, silent=False)
-
-        if not isinstance(payload, dict):
-            return jsonify({"ok": False, "error": "Expected JSON object."}), 400
+        payload = parse_inbound_request()
 
         sn_data = normalize_servicenow_payload(payload)
         archer_payload = build_archer_reverse_payload(sn_data)
@@ -966,25 +1040,15 @@ def servicenow_to_archer():
 @app.route("/debug-env", methods=["GET"])
 def debug_env():
     required_vars = [
-        "SERVICENOW_INSTANCE_URL",
-        "SERVICENOW_USERNAME",
-        "SERVICENOW_PASSWORD",
-        "SERVICENOW_TABLE",
-        "ARCHER_API_BASE_URL",
-        "ARCHER_SOAP_BASE_URL",
-        "ARCHER_INSTANCE_NAME",
-        "ARCHER_USERNAME",
-        "ARCHER_PASSWORD",
-        "FINDINGS_APPLICATION_GUID",
-        "ARCHER_FIELD_FINDING_ID_GUID",
-        "ARCHER_FIELD_FINDING_GUID",
-        "ARCHER_REVERSE_SYNC_DRY_RUN",
-        "FLASK_DEBUG",
-        "CORS_ORIGINS",
+        "SERVICENOW_INSTANCE_URL", "SERVICENOW_USERNAME", "SERVICENOW_PASSWORD",
+        "SERVICENOW_TABLE", "ARCHER_API_BASE_URL", "ARCHER_SOAP_BASE_URL",
+        "ARCHER_INSTANCE_NAME", "ARCHER_USERNAME", "ARCHER_PASSWORD",
+        "FINDINGS_APPLICATION_GUID", "FINDINGS_APPLICATION_ID",
+        "ARCHER_FIELD_FINDING_ID_GUID", "ARCHER_FIELD_FINDING_GUID",
+        "ARCHER_REVERSE_SYNC_DRY_RUN", "FLASK_DEBUG", "CORS_ORIGINS",
     ]
 
     result = {}
-
     for key in required_vars:
         value = os.getenv(key)
         result[key] = {
@@ -1005,15 +1069,7 @@ def debug_servicenow():
             params={"sysparm_limit": "1"},
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-
-        return jsonify(
-            {
-                "ok": resp.ok,
-                "status_code": resp.status_code,
-                "preview": resp.text[:500],
-            }
-        ), resp.status_code
-
+        return jsonify({"ok": resp.ok, "status_code": resp.status_code, "preview": resp.text[:500]}), resp.status_code
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -1022,17 +1078,9 @@ def debug_servicenow():
 def debug_archer_login():
     try:
         token = archer_login()
-
-        return jsonify(
-            {
-                "ok": True,
-                "token_exists": bool(token),
-                "token_preview": token[:6] + "..." if token else None,
-            }
-        ), 200
-
+        return jsonify({"ok": True, "token_exists": bool(token), "token_preview": token[:6] + "..." if token else None}), 200
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": False, "error": str(exc), "traceback": traceback.format_exc()}), 500
 
 
 # ============================================================
