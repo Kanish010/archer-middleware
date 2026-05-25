@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import os
 import re
+import traceback
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -103,6 +104,13 @@ else:
 # ============================================================
 # General helpers
 # ============================================================
+
+def safe_get(data: Any, key: str, default: Any = None) -> Any:
+    """Safely call .get() — returns default if data is not a dict."""
+    if isinstance(data, dict):
+        return data.get(key, default)
+    return default
+
 
 def clean_html_text(value: Any) -> str:
     if value is None:
@@ -340,9 +348,9 @@ def archer_login() -> str:
     data = response.json()
 
     token = (
-        data.get("RequestedObject", {}).get("SessionToken")
-        or data.get("SessionToken")
-        or data.get("sessionToken")
+        safe_get(safe_get(data, "RequestedObject", {}), "SessionToken")
+        or safe_get(data, "SessionToken")
+        or safe_get(data, "sessionToken")
     )
 
     if not token:
@@ -365,18 +373,21 @@ def get_archer_application_by_guid(token: str, application_guid: str) -> Dict[st
 
     data = response.json()
 
-    # ── Fix: handle both list and dict responses ──────────────────
-    requested = data.get("RequestedObject", data)
-
-    if isinstance(requested, list):
-        apps = requested
-    elif isinstance(requested, dict):
-        apps = requested.get("Applications", requested.get("Value", []))
-        if not isinstance(apps, list):
-            apps = [apps]
+    # Handle both list and dict responses from Archer
+    if isinstance(data, list):
+        apps = data
+    elif isinstance(data, dict):
+        requested = data.get("RequestedObject", data)
+        if isinstance(requested, list):
+            apps = requested
+        elif isinstance(requested, dict):
+            apps = requested.get("Applications", requested.get("Value", []))
+            if not isinstance(apps, list):
+                apps = [apps]
+        else:
+            apps = []
     else:
         apps = []
-    # ─────────────────────────────────────────────────────────────
 
     for app_item in apps:
         if not isinstance(app_item, dict):
@@ -405,13 +416,22 @@ def get_archer_field_ids(
     response.raise_for_status()
 
     data = response.json()
-    fields = data.get("RequestedObject", data)
 
-    if isinstance(fields, dict):
-        fields = fields.get("FieldDefinitions", fields.get("Value", []))
-
-    if not isinstance(fields, list):
-        raise RuntimeError(f"Could not parse Archer field definitions response: {data}")
+    # Handle both list and dict responses from Archer
+    if isinstance(data, list):
+        fields = data
+    elif isinstance(data, dict):
+        requested = data.get("RequestedObject", data)
+        if isinstance(requested, list):
+            fields = requested
+        elif isinstance(requested, dict):
+            fields = requested.get("FieldDefinitions", requested.get("Value", []))
+            if not isinstance(fields, list):
+                fields = [fields]
+        else:
+            fields = []
+    else:
+        fields = []
 
     result: Dict[str, int] = {}
 
@@ -422,6 +442,8 @@ def get_archer_field_ids(
         matched_field = None
 
         for field in fields:
+            if not isinstance(field, dict):
+                continue
             field_guid = str(field.get("Guid") or field.get("GUID") or "").lower()
             if field_guid == target_guid.lower():
                 matched_field = field
@@ -864,13 +886,13 @@ def archer_to_servicenow():
         ), 201
 
     except requests.HTTPError as exc:
-        response = exc.response
+        resp = exc.response
         return jsonify(
             {
                 "ok": False,
                 "error": "ServiceNow HTTP error",
-                "status_code": response.status_code if response else None,
-                "response": response.text[:1000] if response else None,
+                "status_code": resp.status_code if resp else None,
+                "response": resp.text[:1000] if resp else None,
             }
         ), 500
 
@@ -879,6 +901,7 @@ def archer_to_servicenow():
             {
                 "ok": False,
                 "error": str(exc),
+                "traceback": traceback.format_exc(),
             }
         ), 500
 
@@ -916,13 +939,13 @@ def servicenow_to_archer():
         ), 200
 
     except requests.HTTPError as exc:
-        response = exc.response
+        resp = exc.response
         return jsonify(
             {
                 "ok": False,
                 "error": "HTTP error during ServiceNow to Archer sync",
-                "status_code": response.status_code if response else None,
-                "response": response.text[:1000] if response else None,
+                "status_code": resp.status_code if resp else None,
+                "response": resp.text[:1000] if resp else None,
             }
         ), 500
 
@@ -931,13 +954,13 @@ def servicenow_to_archer():
             {
                 "ok": False,
                 "error": str(exc),
+                "traceback": traceback.format_exc(),
             }
         ), 500
 
 
 # ============================================================
-# Temporary debug routes
-# Remove these after Azure testing is complete
+# Debug routes
 # ============================================================
 
 @app.route("/debug-env", methods=["GET"])
@@ -975,7 +998,7 @@ def debug_env():
 @app.route("/debug-servicenow", methods=["GET"])
 def debug_servicenow():
     try:
-        response = requests.get(
+        resp = requests.get(
             servicenow_table_url(),
             headers=servicenow_headers(),
             auth=(SERVICENOW_USERNAME, SERVICENOW_PASSWORD),
@@ -985,19 +1008,14 @@ def debug_servicenow():
 
         return jsonify(
             {
-                "ok": response.ok,
-                "status_code": response.status_code,
-                "preview": response.text[:500],
+                "ok": resp.ok,
+                "status_code": resp.status_code,
+                "preview": resp.text[:500],
             }
-        ), response.status_code
+        ), resp.status_code
 
     except Exception as exc:
-        return jsonify(
-            {
-                "ok": False,
-                "error": str(exc),
-            }
-        ), 500
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/debug-archer-login", methods=["GET"])
@@ -1014,17 +1032,11 @@ def debug_archer_login():
         ), 200
 
     except Exception as exc:
-        return jsonify(
-            {
-                "ok": False,
-                "error": str(exc),
-            }
-        ), 500
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 # ============================================================
-# Local run only
-# Azure uses Gunicorn startup command instead
+# Entry point
 # ============================================================
 
 if __name__ == "__main__":
